@@ -557,13 +557,111 @@ def self_test(path, steps):
     return ok_all
 
 
+def _data_frame(lba, payload):
+    body = b"D" + lba.to_bytes(4, "little") + bytes([0]) + payload
+    return bytes([0x01]) + body + crc16(body).to_bytes(2, "little")
+
+
+def _run_writer(com, worklist, bad_chs=None, drop_ack_at=None, steps=3_000_000):
+    """Drive WR.COM in the write direction: model the host sending a worklist
+    then streaming DATA frames, feeding the next on the DOS's ACK and resending
+    on NAK. Optionally force one INT13 AH=03 write to fail, or simulate one lost
+    ACK to exercise the de-dup path."""
+    e = Emu(com)
+    c, h, s = 2, 1, 4
+    lbas = [l for a, b in worklist for l in range(a, b)]
+    frames = [_data_frame(l, bytes([(l * 7 + i) & 0xFF for i in range(512)])) for l in lbas]
+    st = {"frame": bytearray(), "idx": -1, "eot": None, "dropped": False, "acks": 0}
+
+    def feed_next():
+        st["idx"] += 1
+        if st["idx"] < len(frames):
+            e.rx.extend(frames[st["idx"]])
+
+    def do_int(self, n, _o=Emu.do_int):
+        ah = (self.r["ax"] >> 8) & 0xFF
+        if n == 0x13 and ah == 0x08:
+            self.r["cx"] = (((c - 1) & 0xFF) << 8) | ((((c - 1) >> 2) & 0xC0) | s)
+            self.r["dx"] = 0x0080; self.CF = 0; return
+        if n == 0x13 and ah == 0x03:
+            ch = (self.r["cx"] >> 8) & 0xFF; sec = self.r["cx"] & 0x3F
+            dh = (self.r["dx"] >> 8) & 0xFF
+            self.writes = getattr(self, "writes", [])
+            if bad_chs is not None and (ch, sec, dh) == bad_chs:
+                self.CF = 1; self.r["ax"] = (0x0A << 8) | (self.r["ax"] & 0xFF); return
+            self.writes.append((ch, sec, dh)); self.CF = 0; self.r["ax"] &= 0xFF; return
+        if n == 0x13 and ah == 0x00: self.CF = 0; return
+        if n == 0x16 and ah == 0x00:
+            self.r["ax"] = (0x15 << 8) | 0x59; return          # confirm key 'Y'
+        if n == 0x16: self.ZF = 1; return
+        return _o(self, n)
+    e.do_int = types.MethodType(do_int, e)
+
+    def uart_out(self, port, val):
+        base = 0x3F8
+        if port == base + 3: self.lcr = val & 0xFF; return
+        if (getattr(self, "lcr", 0) & 0x80) or port == base + 1 or port != base:
+            return
+        b = val & 0xFF; self.tx.append(b); fr = st["frame"]
+        if fr:
+            fr.append(b); need = {0x49: 16, 0x45: 12}.get(fr[1] if len(fr) > 1 else 0)
+            if need and len(fr) >= need:
+                if fr[1] == 0x49:                              # INFO -> worklist + 1st DATA
+                    self.rx.extend(cmd_frame(worklist)); st["idx"] = -1; feed_next()
+                elif fr[1] == 0x45:                            # EOT -> record + ack
+                    st["eot"] = (int.from_bytes(fr[2:6], "little"),
+                                 int.from_bytes(fr[6:10], "little"))
+                    self.rx.append(0x06)
+                st["frame"] = bytearray()
+            return
+        if b == 0x01: st["frame"] = bytearray([0x01])
+        elif b == 0x06:
+            st["acks"] += 1
+            if drop_ack_at is not None and st["idx"] == drop_ack_at and not st["dropped"]:
+                st["dropped"] = True; e.rx.extend(frames[st["idx"]])   # simulate lost ACK
+            else:
+                feed_next()
+        elif b == 0x15:
+            e.rx.extend(frames[st["idx"]])                     # NAK -> resend current
+    e.uart_out = types.MethodType(uart_out, e)
+    e.run(b"", maxsteps=steps)
+    return e, st
+
+
+def write_self_test(path, steps):
+    com = open(path, "rb").read()
+    cases = [
+        ("fresh whole-disk",   dict(worklist=[(0, 8)]),                 (8, 0), 8),
+        ("one bad write",      dict(worklist=[(0, 8)], bad_chs=(1, 2, 0)), (7, 1), 7),
+        ("scattered ranges",   dict(worklist=[(1, 2), (4, 6)]),         (3, 0), 3),
+        ("lost ACK @ sector0", dict(worklist=[(0, 8)], drop_ack_at=0),  (8, 0), 8),
+        ("lost ACK @ sector3", dict(worklist=[(0, 8)], drop_ack_at=3),  (8, 0), 8),
+    ]
+    ok_all = True
+    for label, kw, want_eot, want_unique in cases:
+        e, st = _run_writer(com, steps=steps, **kw)
+        con = bytes(e.console).decode("latin1")
+        uniq = len(set(getattr(e, "writes", [])))
+        ok = ("Done." in con and st["eot"] == want_eot and uniq == want_unique)
+        ok_all &= ok
+        print(f"  [{'PASS' if ok else 'FAIL'}] {label:20s} EOT(good,bad)={st['eot']} "
+              f"unique_writes={uniq}")
+    return ok_all
+
+
 def main():
-    ap = argparse.ArgumentParser(description="8086 logic emulator / self-test for TX.COM")
-    ap.add_argument("binary", help="path to the DOS .COM sender")
+    ap = argparse.ArgumentParser(description="8086 logic emulator / self-test")
+    ap.add_argument("binary", help="path to the DOS .COM sender (TX.COM or WR.COM)")
+    ap.add_argument("--write", action="store_true",
+                    help="run the WRITE-direction self-test (for WR.COM) instead of read")
     ap.add_argument("--steps", type=int, default=3_000_000, help="instruction cap per run")
     args = ap.parse_args()
-    print(f"emu8086 self-test: {args.binary}")
-    ok = self_test(args.binary, args.steps)
+    if args.write:
+        print(f"emu8086 write self-test: {args.binary}")
+        ok = write_self_test(args.binary, args.steps)
+    else:
+        print(f"emu8086 self-test: {args.binary}")
+        ok = self_test(args.binary, args.steps)
     print("ALL PASS" if ok else "FAILURES ABOVE")
     return 0 if ok else 1
 

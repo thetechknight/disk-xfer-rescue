@@ -150,6 +150,46 @@ python rx.py disk.img --verify-only
 ```
 (It reads `disk.img` and `disk.img.map`; no `--port` needed.)
 
+## 8. Writing an image back (`--restore`) — destructive
+
+This is the reverse of imaging: it clones an image file *onto* the DOS box's
+drive. It is bad-sector aware on write — if the drive fails to write a sector,
+it retries, then skips (stubs) it, counts it, and at the end warns you the drive
+may be unreliable. **This erases the target drive**, so both ends make you
+confirm.
+
+You need the writer program `WR.COM` on the DOS box (recreate it from
+`MAKEWR.SCR` the same way you made `TX.COM`: `DEBUG < MAKEWR.SCR`).
+
+1. On the DOS box, run the writer with the same `port baudcode` as before:
+   ```
+   WR 1 5
+   ```
+   It prints a warning and waits. Press a **capital Y** to arm it (any other key
+   aborts and the drive is left untouched).
+2. On Windows, add `--restore`:
+   ```
+   python rx.py disk.img --port COM3 --baud 115200 --restore
+   ```
+   It shows the target drive size vs. the image size, then asks you to type
+   **YES** (all caps) to proceed.
+
+As it runs you'll see a write progress line on the host and dots on the DOS box
+(`B` marks a sector the drive refused). When it finishes:
+```
+Clone complete: 83144 sector(s) written, 0 write failure(s).
+```
+If any sector failed to write, you'll instead get a prominent
+`ALERT: N bad sector(s) found during clone, drive may be unreliable.` — a sign
+the target drive itself is going bad.
+
+Notes:
+- Add `--range 0:1000` (for example) to write only part of the disk.
+- Sectors past the end of the image are left untouched; an image larger than the
+  target has its tail skipped.
+- Resetting the DOS box mid-write leaves a partial clone (as you'd expect); just
+  run it again to overwrite.
+
 ## Time estimate
 
 Roughly: bytes ÷ (baud ÷ 10) ÷ 0.98. A 120 MB disk is about 35 h at 9600,

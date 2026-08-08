@@ -60,6 +60,7 @@ TYPE_INFO, TYPE_DATA, TYPE_EOT = ord('I'), ord('D'), ord('E')
 TYPE_CMD = ord('C')            # host -> TX worklist, sent in reply to INFO
 STATUS_GOOD, STATUS_BAD = 0x00, 0x01
 MAXR = 256                     # max ranges TX can hold (must match proto.h)
+LINK_TRIES = 16                # DATA-frame resends before the restore link is declared dead
 
 # status bytemap values
 UNTRIED, GOOD, BAD = 0, 1, 2
@@ -392,6 +393,139 @@ def send_command(link, ranges, info_bytes):
     return payload
 
 
+def restore_run(args, link):
+    """Write (clone) an image back onto the DOS box's drive.
+
+    Reverse of the capture path: WR.COM on the DOS side announces the target
+    geometry (INFO), we send the worklist, then we stream one DATA frame per
+    sector (read from the image) and wait for WR to ACK each after it writes.
+    WR retries then STUBS unwritable sectors, tallies them, and reports the
+    good/bad totals in its EOT. Bad sectors here mean the *target* drive failed
+    the write, so we surface a clear "drive may be unreliable" alert.
+    """
+    import time
+    bps = 512
+    if not args.image or not os.path.exists(args.image):
+        sys.exit("--restore needs an existing image file to write from.\n"
+                 "  python rx.py disk.img --port COM3 --baud 115200 --restore")
+    img_bytes = os.path.getsize(args.image)
+    img_sectors = img_bytes // bps
+
+    print(f"Restore: waiting for the DOS writer (run WR on the DOS box)...")
+
+    # ---- INFO handshake: receive the target geometry from WR ----
+    total = cyls = heads = spt = 0
+    while True:
+        try:
+            link.hunt_soh()
+            t = link.read_exact(1)[0]
+            if t != TYPE_INFO:
+                continue
+            payload = link.read_exact(12)
+            crc_rx = int.from_bytes(link.read_exact(2), "little")
+            if crc16(bytes([t]) + payload) != crc_rx:
+                continue
+            total = int.from_bytes(payload[0:4], "little")
+            cyls  = int.from_bytes(payload[4:6], "little")
+            heads = int.from_bytes(payload[6:8], "little")
+            spt   = int.from_bytes(payload[8:10], "little")
+            break
+        except TimeoutError:
+            continue
+
+    # ---- what to write ----
+    if args.range:
+        ranges = parse_ranges_spec(args.range, total)
+    else:
+        ranges = [(0, min(img_sectors, total))]
+    n_sectors = sum(b - a for a, b in ranges)
+
+    print(f"\n  Target drive : {cyls}c x {heads}h x {spt}s = {total} sectors "
+          f"({total * bps / 1e6:.1f} MB)")
+    print(f"  Source image : {args.image}  ({img_sectors} sectors, "
+          f"{img_bytes / 1e6:.1f} MB)")
+    print(f"  Will write   : {n_sectors} sector(s)"
+          + (f" over {len(ranges)} range(s)" if args.range else ""))
+    if img_sectors > total:
+        print("  WARNING: the image is LARGER than the target; the tail won't fit "
+              "and is skipped.")
+    elif img_sectors < total and not args.range:
+        print("  NOTE: the image is smaller than the target; sectors past the "
+              "image are left untouched.")
+
+    # ---- hard confirmation (this is destructive) ----
+    print("\n  *** THIS OVERWRITES THE TARGET DRIVE. Existing data is lost. ***")
+    try:
+        if input("  Type YES (all caps) to proceed: ").strip() != "YES":
+            sys.exit("Aborted; nothing was sent. (You can reset the DOS box.)")
+    except (EOFError, KeyboardInterrupt):
+        sys.exit("\nAborted; nothing was sent.")
+
+    # ---- send the worklist, then stream the sectors ----
+    send_command(link, ranges, None)
+    time.sleep(0.1)                       # let WR finish recv_command and start hunting
+
+    start = time.time()
+    sent = 0
+    try:
+        with open(args.image, "rb") as f:
+            for a, b in ranges:
+                for lba in range(a, b):
+                    f.seek(lba * bps)
+                    data = f.read(bps)
+                    if len(data) < bps:
+                        data += bytes(bps - len(data))     # pad a short tail
+                    payload = (lba.to_bytes(4, "little")
+                               + bytes([STATUS_GOOD]) + data)
+                    for _ in range(LINK_TRIES):
+                        link.send_frame(TYPE_DATA, payload)
+                        # generous: WR may spend seconds retrying a bad write
+                        if link.read_reply(8.0) == ACK:
+                            break
+                    else:
+                        sys.exit(f"\nLink lost at LBA {lba} "
+                                 f"(no ACK after {LINK_TRIES} tries).")
+                    sent += 1
+                    if sent % 64 == 0 or sent == n_sectors:
+                        pct = 100.0 * sent / n_sectors
+                        rate = sent * bps / max(1e-6, time.time() - start)
+                        sys.stdout.write(
+                            f"\r  writing: {sent}/{n_sectors} ({pct:5.1f}%)  "
+                            f"{rate/1024:6.1f} KB/s   ")
+                        sys.stdout.flush()
+    except KeyboardInterrupt:
+        print("\nInterrupted; the drive holds a partial clone.")
+        return
+
+    # ---- receive WR's EOT tally ----
+    good = bad = 0
+    while True:
+        try:
+            link.hunt_soh()
+            t = link.read_exact(1)[0]
+            if t != TYPE_EOT:
+                continue
+            payload = link.read_exact(8)
+            crc_rx = int.from_bytes(link.read_exact(2), "little")
+            if crc16(bytes([t]) + payload) != crc_rx:
+                link.nak(); continue
+            link.ack()
+            good = int.from_bytes(payload[0:4], "little")
+            bad  = int.from_bytes(payload[4:8], "little")
+            break
+        except TimeoutError:
+            continue
+
+    print(f"\n\nClone complete: {good} sector(s) written, {bad} write failure(s).")
+    if bad:
+        bar = "!" * 64
+        print("\n" + bar)
+        print(f"  ALERT: {bad} bad sector(s) found during clone, "
+              f"drive may be unreliable.")
+        print(bar)
+    return
+
+
 def main():
     ap = argparse.ArgumentParser(description="ddrescue-style serial disk receiver")
     ap.add_argument("image", nargs="?", help="output image file, e.g. disk.img")
@@ -408,6 +542,11 @@ def main():
                          "and whether any bad/untried sectors land inside them)")
     ap.add_argument("--verify-only", action="store_true",
                     help="skip the transfer; just verify an existing image + map")
+    ap.add_argument("--restore", action="store_true",
+                    help="REVERSE the transfer: write (clone) IMAGE back onto the "
+                         "DOS box's drive using WR.COM. Destructive; prompts for "
+                         "confirmation and reports any sectors the drive failed to "
+                         "write. Combine with --range to write only part.")
     ap.add_argument("--range", default=None,
                     help="image specific LBA ranges instead of the auto worklist, "
                          "e.g. 0:200 or 100:150,43301:43302 (END is exclusive). "
@@ -449,6 +588,9 @@ def main():
                         bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
                         stopbits=serial.STOPBITS_ONE)
     link = Link(ser)
+
+    if args.restore:
+        return restore_run(args, link)
 
     print(f"Listening on {args.port} @ {args.baud} baud. Start TX on the DOS box now.")
 

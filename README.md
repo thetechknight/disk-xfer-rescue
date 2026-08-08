@@ -7,7 +7,7 @@ drive has bad sectors you don't want to give up on.
 It images the first BIOS hard disk over a plain null-modem cable, retries and
 then stubs unreadable sectors instead of aborting, records them in a
 ddrescue-compatible mapfile, and can **resume** a later pass that re-reads only
-the bad/untried sectors.
+the bad/untried sectors. Verified end-to-end on a Compaq LTE 286.
 
 ```
   DOS box  -- COMx -->  null-modem cable  -->  COM / USB-serial  --  modern host
@@ -24,7 +24,18 @@ the bad/untried sectors.
 
 ## Build target: Intel 8086/8088 (non-negotiable)
 
-**If a build errors on an instruction, fix the instruction -- never
+The DOS sender is assembled with **`.arch i8086`** and the OpenWatcom path uses
+**`-0`**, so no 186/286/386 instruction can slip in. This matters on real
+vintage hardware: a single newer opcode -- a shift-by-immediate, a `push imm`,
+or the near `Jcc` (`0F 8x`) the assembler emits when a conditional jump target
+is more than 127 bytes away -- is an **invalid opcode** on an 8086/8088 (the
+near `Jcc` is invalid on the 80286 too) and hangs the machine hard with no
+diagnostic.
+
+That was the root cause of the long-standing "hangs right after *Linked*" bug: a
+far `jae` compiled to a 386-only `0F 83`. See the [CHANGELOG](CHANGELOG.md).
+`tools/check_8086.py` verifies the emitted binary; run it after any change to the
+sender. **If a build errors on an instruction, fix the instruction -- never
 raise the arch to silence it.**
 
 ---
@@ -42,7 +53,13 @@ raise the arch to silence it.**
 - **Verify (`--verify` / `--verify-only`).** Inspects a captured image: map
   completeness, MBR signature, partition table, FAT label, and whether any
   bad/untried sectors land inside a partition. `--verify-only` needs no port.
-- **Manual range override (`--range A:B[,C:D]`)** for targeted re-reads.
+- **Restore / clone-back (`--restore`).** Write an image *back* onto the drive
+  over the same cable, and it's **bad-sector aware on write**: a sector the drive
+  refuses is retried, then stubbed (skipped) and counted, and you get a clear
+  **"X bad sectors found during clone, drive may be unreliable"** alert. Both
+  ends confirm first (this is destructive).
+- **Manual range override (`--range A:B[,C:D]`)** for targeted re-reads (and
+  partial restores).
 - **Clean abort.** `ESC` / `Ctrl-C` on the DOS box (or just resetting it -- the
   drive is only ever read) stops safely; the host keeps what's imaged.
 - **Live progress on both ends** -- position, good/bad counts, throughput, ETA.
@@ -57,11 +74,14 @@ side drives an 8250/16550 UART directly, polled. See
 rx-host/
   rx.py                Python 3 host receiver (pyserial): image + mapfile + verify + progress
 tx-msdos/
-  TX.COM               prebuilt, ready-to-run DOS sender (pure 8086)
-  MAKETX.SCR           DEBUG script that recreates TX.COM on the DOS box (no toolchain needed)
+  TX.COM               prebuilt DOS READER/sender  (imaging)     -- pure 8086
+  WR.COM               prebuilt DOS WRITER/receiver (restore)     -- pure 8086
+  MAKETX.SCR           DEBUG script that recreates TX.COM on the DOS box (no toolchain)
+  MAKEWR.SCR           DEBUG script that recreates WR.COM on the DOS box (no toolchain)
   Makefile, build.bat  OpenWatcom build of the C sender (TX.EXE)
   src/
-    tx.S               the shipped sender, GNU as, .arch i8086   [primary, battle-tested]
+    tx.S               the shipped reader, GNU as, .arch i8086   [primary, battle-tested]
+    wr.S               the shipped writer, GNU as, .arch i8086   [restore path]
     main.c             C sender: rescue loop, framing, ACK/NAK, progress
     int13.c/.h         BIOS geometry + sector read (+ reset)     [upstream logic kept]
     serial.c/.h        direct 8250/16550 UART, polled
@@ -125,6 +145,23 @@ sectors.
 python3 rx-host/rx.py disk.img --verify-only
 ```
 
+### Restore: clone an image back onto the drive (destructive)
+
+Run the writer `WR` on the DOS box (instead of `TX`) and add `--restore` on the
+host:
+
+```
+# DOS:  WR 1 5        (COM1 @ 115200; WR warns and waits for a capital Y)
+python3 rx-host/rx.py disk.img --port /dev/ttyUSB0 --baud 115200 --restore
+```
+
+The host prints the target vs. image sizes and asks you to type **YES** before
+anything is written. Sectors the drive fails to write are retried, then skipped
+and counted; at the end you get the totals and, if any failed, the alert
+**"X bad sectors found during clone, drive may be unreliable."** Use `--range`
+to restore only part of the disk. This path only ever writes the sectors in the
+worklist; sectors past the end of the image are left untouched.
+
 ## Host options
 
 ```
@@ -132,6 +169,8 @@ python3 rx-host/rx.py disk.img --verify-only
 --baud         must match TX                                     (default 115200)
 --mapfile      ddrescue mapfile path                             (default <image>.map)
 --resume       keep an existing image; image only bad/untried runs (no truncate)
+--restore      REVERSE: write IMAGE back onto the drive (run WR on DOS). Destructive;
+               prompts for YES, then reports any sectors the drive failed to write
 --range A:B    image specific LBA range(s), comma-separated; overlaid onto the image
 --verify       after capture, inspect MBR/partitions and flag bad sectors inside them
 --verify-only  inspect an existing image + map, no transfer (no --port needed)
@@ -141,12 +180,17 @@ python3 rx-host/rx.py disk.img --verify-only
 
 You don't need to build anything to use the tool. If you want to:
 
-**Assembly (`TX.COM`)** -- GNU binutils:
+**Assembly (`TX.COM` reader, `WR.COM` writer)** -- GNU binutils:
 ```
 as --32 tx-msdos/src/tx.S -o tx.o
 ld -m elf_i386 -Ttext=0x100 --oformat=binary -e _start tx.o -o TX.COM
 python3 tools/check_8086.py TX.COM        # verify pure-8086
-python3 tools/emu8086.py TX.COM           # verify logic off-hardware
+python3 tools/emu8086.py TX.COM           # verify read logic off-hardware
+
+as --32 tx-msdos/src/wr.S -o wr.o
+ld -m elf_i386 -Ttext=0x100 --oformat=binary -e _start wr.o -o WR.COM
+python3 tools/check_8086.py WR.COM        # verify pure-8086
+python3 tools/emu8086.py --write WR.COM   # verify write logic (incl. lost-ACK de-dup)
 ```
 
 **C (`TX.EXE`)** -- [OpenWatcom](https://github.com/open-watcom/open-watcom-v2)

@@ -72,6 +72,31 @@ back and asks only for the runs still marked bad or untried, coalescing them to
 at most `MAXR` ranges by merging across the smallest gaps. A companion
 `.badblocks` file lists the bad LBAs.
 
+## Restore (write) mode
+
+Restore reuses the same frames with the DATA direction reversed. The DOS-side
+writer `WR.COM` plays the role `TX.COM` does for reads:
+
+1. `WR.COM` reads the target geometry and sends **INFO** (same frame).
+2. The host (`rx.py --restore`) replies with a **CMD** worklist.
+3. Now **DATA flows host -> DOS**: the host reads each sector from the image and
+   sends a DATA frame; `WR.COM` CRC-checks it, writes it with INT 13h AH=03
+   (retry then stub on failure), and replies ACK once the write is done (or NAK
+   on a CRC error, which makes the host resend). ACK here therefore means
+   "received and written", so the host allows a generous timeout for it - a
+   failing sector spends several retry cycles before `WR.COM` gives up and acks.
+4. When the worklist is exhausted, `WR.COM` sends **EOT** with the count of
+   sectors written and sectors it failed to write. Any non-zero bad count is a
+   *target-drive* write failure and the host raises the "drive may be
+   unreliable" alert.
+
+**Lost-ACK de-dup.** If a `WR.COM` ACK is lost, the host resends the same DATA
+frame. `WR.COM` compares each frame's LBA to the sector it currently expects; a
+frame for the already-written previous LBA is recognised as a resend and simply
+re-ACKed, never written again. This keeps writes idempotent and correctly
+aligned, the same property the read path gets for free by writing to the frame's
+LBA on the host.
+
 ## Notes for reimplementers
 
 - Keep `MAXR` identical on both ends.

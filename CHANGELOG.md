@@ -6,6 +6,22 @@ All notable changes to this fork are documented here. Format loosely follows
 ## [Unreleased]
 
 ### Added
+- **Restore / clone-back (`WR.COM` + `rx.py --restore`).** The reverse of
+  imaging: write an image back onto the DOS box's drive over the same serial
+  link. `WR.COM` is the DOS-side writer (a mirror of `TX.COM`: it announces
+  geometry, receives the worklist, then receives one DATA frame per sector and
+  writes it with INT 13h AH=03). It is **bad-sector aware on write** - a sector
+  the drive refuses is retried, then **stubbed** (skipped), counted, and marked
+  with `B`; the good/bad totals come back in the EOT. The host prints a clear
+  **"X bad sector(s) found during clone, drive may be unreliable"** alert when
+  any write failed. Because this is destructive, both ends confirm: `WR.COM`
+  requires a capital **Y** on the DOS box and `rx.py --restore` requires typing
+  **YES**. `--range` works in restore too (write only part). The whole path was
+  validated in the emulator end-to-end, including a **simulated lost ACK** to
+  prove the writer's de-dup never double-writes or misaligns a sector.
+  `WR.COM` ships prebuilt with a `MAKEWR.SCR` DEBUG recreate script, is pure
+  8086, and is reproducible byte-for-byte.
+
 - **Resume (`--resume`).** The host reads back the ddrescue-style mapfile and
   asks the sender to re-read only the runs still marked bad or untried,
   coalesced to at most `MAXR` ranges. A new `CMD` worklist frame carries those
