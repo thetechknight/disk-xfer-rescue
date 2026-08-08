@@ -24,18 +24,7 @@ the bad/untried sectors.
 
 ## Build target: Intel 8086/8088 (non-negotiable)
 
-The DOS sender is assembled with **`.arch i8086`** and the OpenWatcom path uses
-**`-0`**, so no 186/286/386 instruction can slip in. This matters on real
-vintage hardware: a single newer opcode -- a shift-by-immediate, a `push imm`,
-or the near `Jcc` (`0F 8x`) the assembler emits when a conditional jump target
-is more than 127 bytes away -- is an **invalid opcode** on an 8086/8088 (the
-near `Jcc` is invalid on the 80286 too) and hangs the machine hard with no
-diagnostic.
-
-That was the root cause of the long-standing "hangs right after *Linked*" bug: a
-far `jae` compiled to a 386-only `0F 83`. See the [CHANGELOG](CHANGELOG.md).
-`tools/check_8086.py` verifies the emitted binary; run it after any change to the
-sender. **If a build errors on an instruction, fix the instruction -- never
+**If a build errors on an instruction, fix the instruction -- never
 raise the arch to silence it.**
 
 ---
