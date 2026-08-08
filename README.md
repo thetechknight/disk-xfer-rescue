@@ -7,7 +7,7 @@ drive has bad sectors you don't want to give up on.
 It images the first BIOS hard disk over a plain null-modem cable, retries and
 then stubs unreadable sectors instead of aborting, records them in a
 ddrescue-compatible mapfile, and can **resume** a later pass that re-reads only
-the bad/untried sectors. Verified end-to-end on a Compaq LTE 286.
+the bad/untried sectors.
 
 ```
   DOS box  -- COMx -->  null-modem cable  -->  COM / USB-serial  --  modern host
